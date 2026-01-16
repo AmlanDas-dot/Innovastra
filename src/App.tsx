@@ -41,15 +41,15 @@ const MEMORY_FLOW: MemoryFieldKey[] = [
 const questionForField = (field: MemoryFieldKey) => {
   switch (field) {
     case "decision":
-      return "What decision are you currently trying to make?";
+      return "What's the choice that's been on your mind lately?";
     case "intent":
-      return "Why is this decision important to you right now?";
+      return "What’s making this choice matter to you at this point in your life?";
     case "constraints":
-      return "Are there any constraints like time, money, risk, or emotional factors?";
+      return "Are there any limits or concerns you’re trying to balance — like time, money, risk, or emotions?";
     case "alternatives":
-      return "What other options have you considered?";
+      return "What other paths or possibilities have crossed your mind so far?";
     case "reasoning":
-      return "What feels like the best choice at the moment, and why?";
+      return "Right now, which option feels most natural or convincing to you — and what’s guiding that feeling?";
     default:
       return "";
   }
@@ -135,7 +135,7 @@ Reasoning: ${memory.reasoning}`
         {
           role: "ai",
           text:
-            "Here’s a structured summary of your decision. Review it, save it, or ask for AI perspectives.",
+            "Here’s a clear snapshot of what you’ve shared so far. Take a moment to review it — you can save it, adjust it, or ask the AI for perspectives",
         },
       ]);
     }
@@ -192,7 +192,7 @@ Alternatives: ${m.alternatives || "—"}`
 
     setMessages((prev) => [
       ...prev,
-      { role: "ai", text: "Analyzing trade-offs and risks…"
+      { role: "ai", text: "Reflecting on your decision…"
  },
     ]);
 
@@ -256,8 +256,8 @@ REFLECTIVE QUESTION:
       <div className="container">
 
         <header className="header">
-          <h1 className="title">Human–AI Decision Memory</h1>
-          <p className="subtitle">AI assists. Humans decide.</p>
+          <h1 className="title">Thinkly.AI</h1>
+          <p className="subtitle">AI supports your thinking. You make the choice.</p>
         </header>
 
 
@@ -292,7 +292,7 @@ REFLECTIVE QUESTION:
                 }}
                 rows={2}
                 className="message-input"
-                placeholder="Type your response…"
+                placeholder="Take your time, I am here…"
               />
 
               <button
