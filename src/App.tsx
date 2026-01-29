@@ -1,19 +1,20 @@
 import { useState, useEffect } from "react";
-import { Sparkles } from "lucide-react";
 import OpenAI from "openai";
 import { useRef } from "react";
-
 
 /* ---------------- Types ---------------- */
 
 type DecisionMemory = {
   id: string;
+  title: string;
+  summary: string;
   decision: string;
   intent: string;
   constraints: string;
   alternatives: string;
   reasoning: string;
   archived?: boolean;
+  createdAt: number;
 };
 
 type Message = {
@@ -27,6 +28,11 @@ type MemoryFieldKey =
   | "constraints"
   | "alternatives"
   | "reasoning";
+
+type ConversationMode =
+  | "capturing"
+  | "review"
+  | "reflecting";
 
 /* ---------------- Conversation Flow ---------------- */
 
@@ -58,6 +64,12 @@ const questionForField = (field: MemoryFieldKey) => {
 /* ---------------- App ---------------- */
 
 export default function App() {
+  const [flashcardSearch, setFlashcardSearch] = useState("");
+  const [flashcardDate, setFlashcardDate] = useState<"all" | "week" | "month" | "year">("all");
+  const [isSidebarOpen, setIsSidebarOpen] = useState(true);
+  const [suggestedMemoryIndexes, setSuggestedMemoryIndexes] = useState<number[]>([]);
+
+
   /* ---------------- OpenAI ---------------- */
   const openai = new OpenAI({
     apiKey: import.meta.env.VITE_OPENAI_API_KEY,
@@ -71,6 +83,9 @@ export default function App() {
 
   const [currentField, setCurrentField] =
     useState<MemoryFieldKey>("decision");
+
+  const [conversationMode, setConversationMode] =
+    useState<ConversationMode>("capturing");
 
   const [memory, setMemory] = useState<Omit<DecisionMemory, "id">>({
     decision: "",
@@ -102,6 +117,134 @@ export default function App() {
 
   /* ---------------- Derived ---------------- */
 
+  const now = Date.now();
+
+  const isWithinRange = (createdAt: number) => {
+    const diff = now - createdAt;
+
+    switch (flashcardDate) {
+      case "week":
+        return diff <= 7 * 24 * 60 * 60 * 1000;
+      case "month":
+        return diff <= 30 * 24 * 60 * 60 * 1000;
+      case "year":
+        return diff <= 365 * 24 * 60 * 60 * 1000;
+      default:
+        return true;
+    }
+  };
+
+  const isMemoryVisible = (mem: DecisionMemory) => {
+    const text = `${mem.decision} ${mem.reasoning} ${mem.constraints}`.toLowerCase();
+    const matchesSearch = text.includes(flashcardSearch.toLowerCase());
+
+    const matchesArchive =
+      flashcardView === "active" ? !mem.archived : mem.archived;
+
+    const matchesDate = isWithinRange(mem.createdAt);
+
+    return matchesSearch && matchesArchive && matchesDate;
+  };
+
+  const extractKeywords = (text: string) => {
+    return text
+      .toLowerCase()
+      .replace(/[^\w\s]/g, "") // remove punctuation
+      .split(/\s+/)
+      .filter(
+        (word) =>
+          word.length > 3 && // avoid noise
+          ![
+            "this",
+            "that",
+            "with",
+            "from",
+            "there",
+            "about",
+            "should",
+            "could",
+            "would",
+            "which",
+          ].includes(word)
+      );
+  };  
+
+  const getMemoryRelevanceScore = (
+    mem: DecisionMemory,
+    keywords: string[]
+  ) => {
+    let score = 0;
+
+    keywords.forEach((kw) => {
+      if (mem.decision.toLowerCase().includes(kw)) score += 2;
+      if (mem.reasoning.toLowerCase().includes(kw)) score += 1;
+      if (mem.constraints.toLowerCase().includes(kw)) score += 1;
+    });
+
+    // small recency boost
+    const daysOld =
+      (Date.now() - mem.createdAt) / (1000 * 60 * 60 * 24);
+
+    if (daysOld < 30) score += 1;
+
+    return score;
+  };
+
+  const getSuggestedMemoryIndexes = () => {
+    const activeText = `
+      ${memory.decision}
+      ${memory.intent}
+      ${memory.constraints}
+      ${memory.reasoning}
+    `;
+
+    const keywords = extractKeywords(activeText);
+
+    if (keywords.length === 0) return [];
+
+    const threshold = keywords.length > 4 ? 3 : 2;
+
+    return savedMemories
+      .map((mem, index) => ({
+        index,
+        score: getMemoryRelevanceScore(mem, keywords),
+      }))
+      .filter((item) => item.score >= threshold)
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 3)
+      .map((item) => item.index);
+  };
+
+  useEffect(() => {
+    const suggestions = getSuggestedMemoryIndexes();
+    setSuggestedMemoryIndexes(suggestions);
+  }, [memory, savedMemories]);
+
+  const orderedMemories = [...savedMemories].sort((a, b) => {
+    const aIndex = savedMemories.findIndex((m) => m.id === a.id);
+    const bIndex = savedMemories.findIndex((m) => m.id === b.id);
+
+    const aSelected = selectedMemoryIndexes.includes(aIndex);
+    const bSelected = selectedMemoryIndexes.includes(bIndex);
+
+    // Sticky selected memories (absolute priority)
+    if (aSelected && !bSelected) return -1;
+    if (!aSelected && bSelected) return 1;
+
+    const aSuggested =
+      suggestedMemoryIndexes.includes(aIndex) && !aSelected;
+    const bSuggested =
+      suggestedMemoryIndexes.includes(bIndex) && !bSelected;
+
+    //  Suggested
+    if (aSuggested && !bSuggested) return -1;
+    if (!aSuggested && bSuggested) return 1;
+
+    return 0;
+  });
+
+  //MIGHT NEED filteredMemories, removed now for the system uses orderedMemories now.
+
   const canSave = MEMORY_FLOW.every((k) => memory[k].trim());
 
   const synthesis = canSave
@@ -114,8 +257,19 @@ Reasoning: ${memory.reasoning}`
 
   /* ---------------- Conversation ---------------- */
 
+
+
   const handleSend = () => {
     if (!input.trim()) return;
+
+    //Blocked typing during review
+    if (conversationMode === "review") return;
+
+    // different behaviour in reflection mode
+      if (conversationMode === "reflecting") {
+        continueReflection();
+        return;
+      }
 
     setMessages((prev) => [...prev, { role: "user", text: input }]);
     setMemory((prev) => ({ ...prev, [currentField]: input }));
@@ -135,22 +289,83 @@ Reasoning: ${memory.reasoning}`
         {
           role: "ai",
           text:
-            "Here’s a clear snapshot of what you’ve shared so far. Take a moment to review it — you can save it, adjust it, or ask the AI for perspectives",
+            `Here’s a clear snapshot of what you’ve shared.
+
+            You’re now in Review Mode.
+            • Editing is paused to preserve clarity
+            • You can still edit fields manually
+            • Choose one of the actions below when ready`,
+
+            
         },
       ]);
+      setConversationMode("review");
     }
 
     setInput("");
   };
 
+
   /* ---------------- Save Decision ---------------- */
 
-  const saveDecision = () => {
+  const generateSummary = async (memory: {
+    decision: string;
+    intent: string;
+    constraints: string;
+    alternatives: string;
+    reasoning: string;
+  }) => {
+    try {
+      const response = await openai.chat.completions.create({
+        model: "gpt-4o-mini",
+        messages: [
+          {
+            role: "system",
+            content: `You summarize completed personal decisions.
+
+  Rules:
+  - ONE sentence only
+  - Max 30 words
+  - Past tense
+  - Neutral and factual
+  - No advice
+  - No judgment
+  - No new information`,
+          },
+          {
+            role: "user",
+            content: `Decision context:
+  Decision: ${memory.decision}
+  Intent: ${memory.intent}
+  Constraints: ${memory.constraints}
+  Alternatives: ${memory.alternatives}
+  Reasoning: ${memory.reasoning}
+
+  Return ONLY the summary sentence.`,
+          },
+        ],
+      });
+
+      return (
+        response.choices[0]?.message?.content?.trim() ??
+        "Summary unavailable"
+      );
+    } catch {
+      return "Summary unavailable";
+    }
+  };
+
+
+  const saveDecision = async () => {
+    const summary = await generateSummary(memory);
+
     setSavedMemories((prev) => [
       {
         ...memory,
+        summary,
         id: crypto.randomUUID(),
         archived: false,
+        createdAt: Date.now(),
       },
       ...prev,
     ]);
@@ -165,9 +380,9 @@ Reasoning: ${memory.reasoning}`
     });
 
     setCurrentField("decision");
+    setConversationMode("capturing");
     setMessages([{ role: "ai", text: questionForField("decision") }]);
   };
-
 
   /* ---------------- AI Advisory ---------------- */
 
@@ -184,8 +399,8 @@ Reasoning: ${memory.reasoning}`
             .map(
               (m, idx) =>
                 `${idx + 1}. Decision: ${m.decision}
-Constraints: ${m.constraints || "—"}
-Alternatives: ${m.alternatives || "—"}`
+                Constraints: ${m.constraints || "—"}
+                Alternatives: ${m.alternatives || "—"}`
             )
             .join("\n\n")}`
         : "";
@@ -204,12 +419,12 @@ Alternatives: ${m.alternatives || "—"}`
       role: "system",
       content: `You are an advisory assistant helping a human reflect on a decision.
 
-Rules:
-- Do NOT make decisions for the user
-- Do NOT add new facts
-- Do NOT modify or reinterpret the decision
-- Use only the provided context
-- Be concise and structured`,
+      Rules:
+      - Do NOT make decisions for the user
+      - Do NOT add new facts
+      - Do NOT modify or reinterpret the decision
+      - Use only the provided context
+      - Be concise and structured`,
     },
     {
       role: "user",
@@ -241,6 +456,9 @@ REFLECTIVE QUESTION:
         ...prev.slice(0, -1),
         { role: "ai", text: aiText },
       ]);
+
+      setConversationMode("reflecting");
+
     } catch {
       setMessages((prev) => [
         ...prev.slice(0, -1),
@@ -248,193 +466,268 @@ REFLECTIVE QUESTION:
       ]);
     }
   };
+  
+  const continueReflection = async () => {
+    const userMessage = input;
+
+    setMessages((prev) => [
+      ...prev,
+      { role: "user", text: userMessage },
+      { role: "ai", text: "Thinking it through…" },
+    ]);
+
+    setInput("");
+
+    try {
+      const response = await openai.chat.completions.create({
+        model: "gpt-4o-mini",
+        messages: [
+          {
+            role: "system",
+            content: `
+  You are a reflective thinking assistant.
+
+  Rules:
+  - Do NOT make decisions for the user
+  - Do NOT change the decision fields
+  - Respond only to the user's question or thought
+  - Stay grounded in the provided decision context
+  - Be concise, calm, and thoughtful
+            `,
+          },
+          {
+            role: "user",
+            content: `
+  Decision context:
+  ${synthesis}
+
+  User reflection:
+  ${userMessage}
+
+  Respond as a continuation of reflection.
+            `,
+          },
+        ],
+      });
+
+      const aiText =
+        response.choices[0]?.message?.content ??
+        "I need a bit more clarity to respond.";
+
+      setMessages((prev) => [
+        ...prev.slice(0, -1),
+        { role: "ai", text: aiText },
+      ]);
+    } catch {
+      setMessages((prev) => [
+        ...prev.slice(0, -1),
+        { role: "ai", text: "Reflection failed. Try again." },
+      ]);
+    }
+  };
+
 
   /* ---------------- UI ---------------- */
 
   return (
-    <div className="app">
-      <div className="container">
+    <div className={`app-layout ${isSidebarOpen ? "sidebar-open" : "sidebar-collapsed"}`}>
+      
+      <div className="flashcard-sidebar">
 
-        <header className="header">
-          <h1 className="title">Thinkly.AI</h1>
-          <p className="subtitle">AI supports your thinking. You make the choice.</p>
-        </header>
+          {/* Toggle ALWAYS visible */}
+        <button
+          className="sidebar-toggle"
+          onClick={() => setIsSidebarOpen(v => !v)}
+          aria-label="Toggle sidebar"
+        />
 
+        {/* Collapsible content */}
+        <div className="sidebar-inner">
 
-        <div className="main-grid">
+        <input
+          type="text"
+          value={flashcardSearch}
+          onChange={(e) => setFlashcardSearch(e.target.value)}
+          placeholder="Look for memories..."
+          className="flashcard-search"
+        />
 
-          {/* Conversation */}
-          <div className="conversation-card">
-            <h2 className="font-semibold mb-4">Conversation</h2>
+        {/* 📅 Date filters */}
+        <div className="flashcard-date-filters">
+          {["all", "week", "month", "year"].map((range) => (
+            <button
+              key={range}
+              className={`date-filter-btn ${
+                flashcardDate === range ? "active" : ""
+              }`}
+              onClick={() =>
+                setFlashcardDate(range as "all" | "week" | "month" | "year")
+              }
+            >
+              {range}
+            </button>
+          ))}
+        </div>
 
-            <div className="messages">
-              {messages.map((m, i) => (
-                <div
-                  key={i}
-                  className={`message ${m.role}`}
-                >
-                  {m.text}
-                </div>
+          <h3 className="font-semibold mb-3">Decision Memories</h3>
 
-              ))}
-              <div ref={messagesEndRef} />
-            </div>
+          <p className="text-xs text-[#999ba1] italic mb-4">
+            Click to include as context
+          </p>
 
-            <div className="input-row">
-              <textarea
-                value={input}
-                onChange={(e) => setInput(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter" && !e.shiftKey) {
-                    e.preventDefault();
-                    handleSend();
-                  }
+          {orderedMemories.map((mem, index) => {
+            const idx = savedMemories.findIndex((m) => m.id === mem.id);
+            const visible = isMemoryVisible(mem);
+
+            const isSuggested =
+              suggestedMemoryIndexes.includes(idx) &&
+              !selectedMemoryIndexes.includes(idx);
+
+            return (
+              <div
+                key={mem.id}
+                className={`sidebar-flashcard-wrapper ${
+                  visible ? "visible" : "hidden"
+                }`}
+                style={{
+                  transitionDelay: visible
+                    ? "0ms"
+                    : `${index * 40}ms`,
                 }}
-                rows={2}
-                className="message-input"
-                placeholder="Take your time, I am here…"
-              />
-
-              <button
-                onClick={handleSend}
               >
-                Send
-              </button>
-            </div>
-          </div>
+                <div
+                  onClick={() =>
+                    setSelectedMemoryIndexes((prev) =>
+                      prev.includes(idx)
+                        ? prev.filter((i) => i !== idx)
+                        : [...prev, idx]
+                    )
+                  }
+                  className={`sidebar-flashcard
+                    ${selectedMemoryIndexes.includes(idx) ? "selected" : ""}
+                    ${isSuggested ? "suggested" : ""}
+                  `}
 
-          {/* Summary */}
-          <div className="panel">
-            <h2 className="font-semibold mb-4">Decision Summary</h2>
-
-            <MemoryField label="Decision" value={memory.decision} onChange={(v) => setMemory((m) => ({ ...m, decision: v }))} />
-            <MemoryField label="Intent" value={memory.intent} onChange={(v) => setMemory((m) => ({ ...m, intent: v }))} />
-            <MemoryField label="Constraints" value={memory.constraints} onChange={(v) => setMemory((m) => ({ ...m, constraints: v }))} />
-            <MemoryField label="Alternatives" value={memory.alternatives} onChange={(v) => setMemory((m) => ({ ...m, alternatives: v }))} />
-            <MemoryField label="Reasoning" value={memory.reasoning} onChange={(v) => setMemory((m) => ({ ...m, reasoning: v }))} />
-
-            {canSave && (
-              <>
-                <pre className="summary-output">{synthesis}</pre>
-
-                <div className="action-row">
-                  <button className="save-btn" onClick={saveDecision}>
-                    Save
-                  </button>
-
-                  <button className="ask-ai-btn" onClick={askAIForAdvice}>
-                    Ask AI
-                  </button>
+                >
+                  <div className="sidebar-flashcard-title">
+                    {mem.decision}
+                  </div>
+                
+                  <div className="sidebar-flashcard-summary">
+                    {mem.summary}
+                  </div>
                 </div>
-              </>
+              </div>
+            );
+          })}
+
+
+          {savedMemories.length > 0 &&
+            savedMemories.every((m) => !isMemoryVisible(m)) && (
+              <p className="text-xs text-[#9ca3af] italic">
+                No matching decisions found
+              </p>
             )}
 
-          </div>
+
         </div>
+      </div>
+      <div className="main-content">
+        <div className="container">
 
-        <div className="flex gap-3 mb-4">
-          <button
-            onClick={() => setFlashcardView("active")}
-            className={`toggle-btn ${
-              flashcardView === "active"
-                ? "font-semibold"
-                : "opacity-60"
-            }`}
-          >
-            Active
-          </button>
-          
-          <button
-            onClick={() => setFlashcardView("archived")}
-            className={`toggle-btn ${
-              flashcardView === "archived"
-                ? "font-semibold"
-                : "opacity-60"
-            }`}
-          >
-            Archived
-          </button>
-        </div>
+          <header className="header">
+            <h1 className="title">Thinkly.AI</h1>
+            <p className="subtitle">AI supports your thinking. You make the choice.</p>
+          </header>
 
 
-        {/* Flashcards */}
-        {savedMemories.some(
-          (m) => flashcardView === "active" ? !m.archived : m.archived
-        ) && (
+          <div className="main-grid">
 
-          <div className="section">
-            <h2 className="font-semibold mb-3">
-              Memory Flashcards
-            </h2>
+            {/* Conversation */}
+            <div className="conversation-card">
+              <h2 className="font-semibold">Conversation</h2>
 
-            <div className="flashcard-grid">
-              {savedMemories.map((mem, idx) => {
-                if (flashcardView === "active" && mem.archived) return null;
-                if (flashcardView === "archived" && !mem.archived) return null;
-                            
-                return (
-
+              <div className="messages">
+                {messages.map((m, i) => (
                   <div
-                    key={mem.id}
-                    onClick={() =>
-                      setSelectedMemoryIndexes((prev) =>
-                        prev.includes(idx)
-                          ? prev.filter((i) => i !== idx)
-                          : [...prev, idx]
-                      )
-                    }
-                    className={`flashcard ${
-                      selectedMemoryIndexes.includes(idx) ? "flashcard-selected" : ""
-                    }`}
+                    key={i}
+                    className={`message ${m.role}`}
                   >
-                    <p><strong>{mem.decision}</strong></p>
-                    <p className="text-sm text-gray-600">
-                      Constraints: {mem.constraints || "—"}
-                    </p>
-                    <p className="text-sm text-gray-600">
-                      Alternatives: {mem.alternatives || "—"}
-                    </p>
-                  
-                    {/* Archive button – only in ACTIVE view */}
-                    {flashcardView === "active" && (
-                      <button
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          setSavedMemories((prev) =>
-                            prev.map((m) =>
-                              m.id === mem.id ? { ...m, archived: true } : m
-                            )
-                          );
-                        }}
-                        className="archive-btn"
-                      >
-                        Archive
-                      </button>
-                    )}
-
-                    {/* Restore button – only in ARCHIVED view */}
-                    {flashcardView === "archived" && (
-                      <button
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          setSavedMemories((prev) =>
-                            prev.map((m) =>
-                              m.id === mem.id ? { ...m, archived: false } : m
-                            )
-                          );
-                        }}
-                        className="restore-btn"
-                      >
-                        Restore
-                      </button>
-                    )}
-
+                    {m.text}
                   </div>
-                );
-              })}
+
+                ))}
+                <div ref={messagesEndRef} />
+              </div>
+              <div className="input-row-wrapper">
+                <div className="input-row">
+                  {conversationMode === "review" ? (
+                    <div className="review-message">
+                      Review mode — choose Save or Ask AI to continue
+                    </div>
+                  ) : (
+                    <>
+                      <textarea
+                        value={input}
+                        onChange={(e) => setInput(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter" && !e.shiftKey) {
+                            e.preventDefault();
+                            handleSend();
+                          }
+                        }}
+                        rows={1}
+                        className="message-input"
+                        placeholder={
+                          conversationMode === "reflecting"
+                            ? "Respond, question, or think aloud…"
+                            : "Take your time, I am here…"
+                        }
+                      />
+                
+                      <button onClick={handleSend}>
+                        Send
+                      </button>
+                    </>
+                  )}
+                </div>
+              </div>
+              </div>
+
+            {/* Summary */}
+            <div className="panel">
+              <h2 className="font-semibold mb-4">Decision Summary</h2>
+
+              <MemoryField label="Decision" value={memory.decision} onChange={(v) => setMemory((m) => ({ ...m, decision: v }))} disabled={conversationMode !== "capturing"}/>
+              <MemoryField label="Intent" value={memory.intent} onChange={(v) => setMemory((m) => ({ ...m, intent: v }))} disabled={conversationMode !== "capturing"} />
+              <MemoryField label="Constraints" value={memory.constraints} onChange={(v) => setMemory((m) => ({ ...m, constraints: v }))} disabled={conversationMode !== "capturing"}/>
+              <MemoryField label="Alternatives" value={memory.alternatives} onChange={(v) => setMemory((m) => ({ ...m, alternatives: v }))} disabled={conversationMode !== "capturing"}/>
+              <MemoryField label="Reasoning" value={memory.reasoning} onChange={(v) => setMemory((m) => ({ ...m, reasoning: v }))} disabled={conversationMode !== "capturing"}/>
+
+              {canSave && (
+                <>
+                  <pre className="summary-output">{synthesis}</pre>
+
+                  {conversationMode === "review" && (
+                    <p className="review-message">
+                      Review actions
+                    </p>
+                  )}
+
+                  <div className="action-row">
+                    <button className="save-btn" onClick={saveDecision}>
+                      Save
+                    </button>
+
+                    <button className="ask-ai-btn" onClick={askAIForAdvice}>
+                      Ask AI
+                    </button>
+                  </div>
+                </>
+              )}
             </div>
           </div>
-        )}
+        </div>
       </div>
     </div>
   );
@@ -446,10 +739,12 @@ function MemoryField({
   label,
   value,
   onChange,
+  disabled = false,
 }: {
   label: string;
   value: string;
   onChange: (v: string) => void;
+  disabled?: boolean;
 }) {
   return (
     <div>
@@ -459,6 +754,7 @@ function MemoryField({
         onChange={(e) => onChange(e.target.value)}
         rows={2}
         className="field-input"
+        disabled={disabled}
       />
     </div>
   );
