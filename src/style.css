@@ -725,3 +725,65 @@ button:active {
   scrollbar-width: thin;
   scrollbar-color: #c084fc transparent;
 }
+
+/* =========================
+   AI Mode Toggle
+========================= */
+
+.ai-toggle-row {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  margin: 12px 0 20px;
+}
+
+.ai-label {
+  font-size: 0.8rem;
+  color: #9ca3af;
+  transition: color 0.2s ease;
+}
+
+.ai-label.active {
+  color: #7c3aed;
+  font-weight: 600;
+}
+
+/* Switch */
+.ai-switch {
+  position: relative;
+  display: inline-block;
+  width: 44px;
+  height: 24px;
+}
+
+.ai-switch input {
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+
+.ai-slider {
+  position: absolute;
+  cursor: pointer;
+  inset: 0;
+  background: linear-gradient(90deg, #ec4899, #a855f7);
+  border-radius: 999px;
+  transition: 0.25s;
+}
+
+.ai-slider::before {
+  content: "";
+  position: absolute;
+  height: 18px;
+  width: 18px;
+  left: 3px;
+  top: 3px;
+  background-color: white;
+  border-radius: 50%;
+  transition: 0.25s;
+}
+
+.ai-switch input:checked + .ai-slider::before {
+  transform: translateX(20px);
+}

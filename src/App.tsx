@@ -70,6 +70,17 @@ export default function App() {
   const [suggestedMemoryIndexes, setSuggestedMemoryIndexes] = useState<number[]>([]);
 
 
+  /* ---------------- AI Mode ---------------- */
+
+  const [aiMode, setAiMode] = useState<"online" | "offline">(() => {
+    return (localStorage.getItem("aiMode") as "online" | "offline") || "online";
+  });
+
+  useEffect(() => {
+    localStorage.setItem("aiMode", aiMode);
+  }, [aiMode]);
+
+
   /* ---------------- OpenAI ---------------- */
   const openai = new OpenAI({
     apiKey: import.meta.env.VITE_OPENAI_API_KEY,
@@ -308,6 +319,49 @@ Reasoning: ${memory.reasoning}`
 
   /* ---------------- Save Decision ---------------- */
 
+  const generateAI = async ({
+    system,
+    user,
+  }: {
+    system: string;
+    user: string;
+  }) => {
+    // ONLINE (GPT)
+    const aiText = await generateAI({
+      system: `You are a reflective thinking assistant.
+
+    Rules:
+    - Do NOT make decisions for the user
+    - Do NOT change the decision fields
+    - Respond only to the user's question or thought
+    - Stay grounded in the provided decision context
+    - Be concise, calm, and thoughtful`,
+      user: `Decision context:
+    ${synthesis}
+
+    User reflection:
+    ${userMessage}
+
+    Respond as a continuation of reflection.`,
+    });
+
+
+    // OFFLINE (Ollama)
+    const res = await fetch("http://localhost:11434/api/generate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "llama3.1:8b",
+        prompt: `${system}\n\n${user}`,
+        stream: false,
+      }),
+    });
+
+    const data = await res.json();
+    return data.response ?? "";
+  };
+
+
   const generateSummary = async (memory: {
     decision: string;
     intent: string;
@@ -316,12 +370,9 @@ Reasoning: ${memory.reasoning}`
     reasoning: string;
   }) => {
     try {
-      const response = await openai.chat.completions.create({
-        model: "gpt-4o-mini",
-        messages: [
-          {
-            role: "system",
-            content: `You summarize completed personal decisions.
+      return (
+        await generateAI({
+          system: `You summarize completed personal decisions.
 
   Rules:
   - ONE sentence only
@@ -331,29 +382,29 @@ Reasoning: ${memory.reasoning}`
   - No advice
   - No judgment
   - No new information`,
-          },
-          {
-            role: "user",
-            content: `Decision context:
-  Decision: ${memory.decision}
-  Intent: ${memory.intent}
-  Constraints: ${memory.constraints}
-  Alternatives: ${memory.alternatives}
-  Reasoning: ${memory.reasoning}
+          user: `Decision:
+  ${memory.decision}
+
+  Intent:
+  ${memory.intent}
+
+  Constraints:
+  ${memory.constraints}
+
+  Alternatives:
+  ${memory.alternatives}
+
+  Reasoning:
+  ${memory.reasoning}
 
   Return ONLY the summary sentence.`,
-          },
-        ],
-      });
-
-      return (
-        response.choices[0]?.message?.content?.trim() ??
-        "Summary unavailable"
-      );
+        })
+      ).trim();
     } catch {
       return "Summary unavailable";
     }
   };
+
 
 
   const saveDecision = async () => {
@@ -397,68 +448,52 @@ Reasoning: ${memory.reasoning}`
       selectedMemories.length > 0
         ? `\nPreviously selected decisions for context:\n${selectedMemories
             .map(
-              (m, idx) =>
-                `${idx + 1}. Decision: ${m.decision}
-                Constraints: ${m.constraints || "—"}
-                Alternatives: ${m.alternatives || "—"}`
+            (m, idx) =>
+              `${idx + 1}. Decision: ${m.decision}
+Constraints: ${m.constraints || "—"}
+Alternatives: ${m.alternatives || "—"}`
             )
             .join("\n\n")}`
         : "";
 
     setMessages((prev) => [
       ...prev,
-      { role: "ai", text: "Reflecting on your decision…"
- },
+      { role: "ai", text: "Reflecting on your decision…" },
     ]);
 
     try {
-      const response = await openai.chat.completions.create({
-  model: "gpt-4o-mini",
-  messages: [
-    {
-      role: "system",
-      content: `You are an advisory assistant helping a human reflect on a decision.
+      const aiText = await generateAI({
+        system: `You are an advisory assistant helping a human reflect on a decision.
 
-      Rules:
-      - Do NOT make decisions for the user
-      - Do NOT add new facts
-      - Do NOT modify or reinterpret the decision
-      - Use only the provided context
-      - Be concise and structured`,
-    },
-    {
-      role: "user",
-      content: `Here is the confirmed decision context:
+  Rules:
+  - Do NOT make decisions for the user
+  - Do NOT add new facts
+  - Do NOT modify or reinterpret the decision
+  - Use only the provided context
+  - Be concise and structured`,
+        user: `Here is the confirmed decision context:
 
-${synthesis}
-${memoryContext}
+  ${synthesis}
+  ${memoryContext}
 
-Respond STRICTLY in this format:
+  Respond STRICTLY in this format:
 
-TRADE-OFFS:
-- (max 3 bullet points)
+  TRADE-OFFS:
+  - (max 3 bullet points)
 
-RISKS / BLIND SPOTS:
-- (max 3 bullet points)
+  RISKS / BLIND SPOTS:
+  - (max 3 bullet points)
 
-REFLECTIVE QUESTION:
-- (only one question, short)`,
-    },
-  ],
-});
-
-
-      const aiText =
-        response.choices[0]?.message?.content ??
-        "Unable to generate advice.";
+  REFLECTIVE QUESTION:
+  - (only one question, short)`,
+      });
 
       setMessages((prev) => [
         ...prev.slice(0, -1),
-        { role: "ai", text: aiText },
+        { role: "ai", text: aiText || "Unable to generate advice." },
       ]);
 
       setConversationMode("reflecting");
-
     } catch {
       setMessages((prev) => [
         ...prev.slice(0, -1),
@@ -466,6 +501,7 @@ REFLECTIVE QUESTION:
       ]);
     }
   };
+
   
   const continueReflection = async () => {
     const userMessage = input;
@@ -479,44 +515,27 @@ REFLECTIVE QUESTION:
     setInput("");
 
     try {
-      const response = await openai.chat.completions.create({
-        model: "gpt-4o-mini",
-        messages: [
-          {
-            role: "system",
-            content: `
-  You are a reflective thinking assistant.
+      const aiText = await generateAI({
+        system: `You are a reflective thinking assistant.
 
   Rules:
   - Do NOT make decisions for the user
   - Do NOT change the decision fields
   - Respond only to the user's question or thought
   - Stay grounded in the provided decision context
-  - Be concise, calm, and thoughtful
-            `,
-          },
-          {
-            role: "user",
-            content: `
-  Decision context:
+  - Be concise, calm, and thoughtful`,
+        user: `Decision context:
   ${synthesis}
 
   User reflection:
   ${userMessage}
 
-  Respond as a continuation of reflection.
-            `,
-          },
-        ],
+  Respond as a continuation of reflection.`,
       });
-
-      const aiText =
-        response.choices[0]?.message?.content ??
-        "I need a bit more clarity to respond.";
 
       setMessages((prev) => [
         ...prev.slice(0, -1),
-        { role: "ai", text: aiText },
+        { role: "ai", text: aiText || "I need a bit more clarity to respond." },
       ]);
     } catch {
       setMessages((prev) => [
@@ -525,6 +544,7 @@ REFLECTIVE QUESTION:
       ]);
     }
   };
+
 
 
   /* ---------------- UI ---------------- */
@@ -640,6 +660,41 @@ REFLECTIVE QUESTION:
             <p className="subtitle">AI supports your thinking. You make the choice.</p>
           </header>
 
+          <div className="ai-toggle-row">
+            <span className={`ai-label ${aiMode === "online" ? "active" : ""}`}>
+              Cloud (GPT)
+            </span>
+                    
+            <label className="ai-switch">
+              <input
+                type="checkbox"
+                checked={aiMode === "offline"}
+                onChange={() =>
+                  setAiMode((prev) => (prev === "online" ? "offline" : "online"))
+                }
+              />
+              <span className="ai-slider" />
+            </label>
+              
+            <span className={`ai-label ${aiMode === "offline" ? "active" : ""}`}>
+              Local (Ollama)
+            </span>
+          </div>
+              
+
+          <div style={{ marginTop: "12px" }}>
+            <label style={{ fontSize: "0.85rem", color: "#6b7280" }}>
+              AI Mode:
+            </label>
+            <select
+              value={aiMode}
+              onChange={(e) => setAiMode(e.target.value as "online" | "offline")}
+              style={{ marginLeft: "8px" }}
+            >
+              <option value="online">Cloud (GPT)</option>
+              <option value="offline">Local (Ollama)</option>
+            </select>
+          </div>
 
           <div className="main-grid">
 
