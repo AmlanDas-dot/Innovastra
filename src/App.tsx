@@ -302,10 +302,10 @@ Reasoning: ${memory.reasoning}`
           text:
             `Here’s a clear snapshot of what you’ve shared.
 
-            You’re now in Review Mode.
-            • Editing is paused to preserve clarity
-            • You can still edit fields manually
-            • Choose one of the actions below when ready`,
+            You’re now in Review Mode. <br>
+            • Editing is paused to preserve clarity <br>
+            • You can still edit fields manually <br>
+            • Choose one of the actions below when ready <br>`,
 
             
         },
@@ -319,47 +319,45 @@ Reasoning: ${memory.reasoning}`
 
   /* ---------------- Save Decision ---------------- */
 
-  const generateAI = async ({
-    system,
-    user,
-  }: {
-    system: string;
-    user: string;
-  }) => {
-    // ONLINE (GPT)
-    const aiText = await generateAI({
-      system: `You are a reflective thinking assistant.
-
-    Rules:
-    - Do NOT make decisions for the user
-    - Do NOT change the decision fields
-    - Respond only to the user's question or thought
-    - Stay grounded in the provided decision context
-    - Be concise, calm, and thoughtful`,
-      user: `Decision context:
-    ${synthesis}
-
-    User reflection:
-    ${userMessage}
-
-    Respond as a continuation of reflection.`,
+const generateAI = async ({
+  system,
+  user,
+}: {
+  system: string;
+  user: string;
+}) => {
+  // ONLINE (GPT)
+  if (aiMode === "online") {
+    const response = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages: [
+        { role: "system", content: system },
+        { role: "user", content: user },
+      ],
     });
 
+    return response.choices[0]?.message?.content ?? "";
+  }
 
-    // OFFLINE (Ollama)
-    const res = await fetch("http://localhost:11434/api/generate", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model: "llama3.1:8b",
-        prompt: `${system}\n\n${user}`,
-        stream: false,
-      }),
-    });
+  // OFFLINE (Ollama)
+  const res = await fetch("http://localhost:11434/api/generate", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "llama3.1:8b",
+      prompt: `${system}\n\n${user}`,
+      stream: false,
+    }),
+  });
 
-    const data = await res.json();
-    return data.response ?? "";
-  };
+  if (!res.ok) {
+    throw new Error("Ollama request failed");
+  }
+
+  const data = await res.json();
+  return data.response ?? "";
+};
+
 
 
   const generateSummary = async (memory: {
