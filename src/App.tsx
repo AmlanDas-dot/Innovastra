@@ -35,15 +35,21 @@ type ConversationMode =
   | "confirm"
   | "reflecting";
 
+type MemoryVector = {
+  id: string; // same as DecisionMemory.id
+  vector: Record<string, number>;
+};
+
+
 /* ---------------- Conversation Flow ---------------- */
 
-const MEMORY_FLOW: MemoryFieldKey[] = [
+/*const MEMORY_FLOW: MemoryFieldKey[] = [
   "decision",
   "intent",
   "constraints",
   "alternatives",
   "reasoning",
-];
+];*/
 
 const questionForField = (field: MemoryFieldKey) => {
   switch (field) {
@@ -73,6 +79,11 @@ export default function App() {
   const [deleteMode, setDeleteMode] = useState(false);
   const [deleteIndexes, setDeleteIndexes] = useState<number[]>([]);
 
+  const deleteMemoryById = (id: string) => {
+    setSavedMemories((prev) => prev.filter((m) => m.id !== id));
+    setMemoryVectors((prev) => prev.filter((v) => v.id !== id));
+    setSelectedMemoryIndexes([]);
+  };
 
   /* ---------------- AI Mode ---------------- */
 
@@ -106,6 +117,10 @@ export default function App() {
   const [savedMemories, setSavedMemories] =
     useState<DecisionMemory[]>([]);
 
+  const [memoryVectors, setMemoryVectors] = useState<MemoryVector[]>([]);
+  const [hasLoadedVectors, setHasLoadedVectors] = useState(false);
+
+
   const [hasLoadedMemories, setHasLoadedMemories] = useState(false);
 
   /* ---------------- Load Saved Memories ---------------- */
@@ -129,6 +144,51 @@ export default function App() {
     "active" | "archived"
   >("active");
 
+  useEffect(() => {
+    const stored = localStorage.getItem("thinkly_vectors");
+
+    if (stored) {
+      try {
+        setMemoryVectors(JSON.parse(stored));
+      } catch (e) {
+        console.error("Failed to load vectors", e);
+      }
+    }
+
+    setHasLoadedVectors(true);
+  }, []);
+
+  /* ---------------- AI System Prompts ---------------- */
+
+  const MEMORY_INFERENCE_SYSTEM = `
+  You are running locally on the user's device.
+  You do not send or receive data from the internet.
+
+  You help a human gain clarity about a personal decision.
+
+  Your role:
+  - Listen carefully
+  - Reflect what the user has expressed
+  - Infer structured fields from natural conversation
+
+  Rules:
+  - Do NOT make decisions for the user
+  - Do NOT invent information
+  - Do NOT force completion of fields
+  - If information is unclear, leave it empty
+  - Use the user's own words when possible
+
+  You must return ONLY valid JSON in this exact shape:
+  {
+    "decision": "",
+    "intent": "",
+    "constraints": "",
+    "alternatives": "",
+    "reasoning": ""
+  }
+  `;
+
+
   /* ---------------- Persist Memories ---------------- */
   useEffect(() => {
     if (!hasLoadedMemories) return;
@@ -139,12 +199,26 @@ export default function App() {
     );
   }, [savedMemories, hasLoadedMemories]);
 
+  useEffect(() => {
+    if (!hasLoadedVectors) return;
+
+    localStorage.setItem(
+      "thinkly_vectors",
+      JSON.stringify(memoryVectors)
+    );
+  }, [memoryVectors, hasLoadedVectors]);
 
 
   /* ---------------- Startup ---------------- */
   useEffect(() => {
-    setMessages([{ role: "ai", text: questionForField("decision") }]);
+    setMessages([
+      {
+        role: "ai",
+        text: "Hey! What’s been weighing on your mind or pulling you in different directions lately?",
+      },
+    ]);
   }, []);
+
 
   /*----------------- Autoscroll --------------*/
   useEffect(() => {
@@ -205,28 +279,36 @@ export default function App() {
       );
   };  
 
-  const getMemoryRelevanceScore = (
-    mem: DecisionMemory,
-    keywords: string[]
+  const buildVector = (text: string): Record<string, number> => {
+    const keywords = extractKeywords(text);
+    const vector: Record<string, number> = {};
+    
+    keywords.forEach((kw) => {
+      vector[kw] = (vector[kw] || 0) + 1;
+    });
+  
+    return vector;
+  };
+
+  const vectorSimilarity = (
+    a: Record<string, number>,
+    b: Record<string, number>
   ) => {
     let score = 0;
 
-    keywords.forEach((kw) => {
-      if (mem.decision.toLowerCase().includes(kw)) score += 2;
-      if (mem.reasoning.toLowerCase().includes(kw)) score += 1;
-      if (mem.constraints.toLowerCase().includes(kw)) score += 1;
+    Object.keys(a).forEach((key) => {
+      if (b[key]) {
+        score += a[key] * b[key];
+      }
     });
-
-    // small recency boost
-    const daysOld =
-      (Date.now() - mem.createdAt) / (1000 * 60 * 60 * 24);
-
-    if (daysOld < 30) score += 1;
 
     return score;
   };
 
-  const getSuggestedMemoryIndexes = () => {
+
+    const getSuggestedMemoryIndexes = () => {
+    if (!hasLoadedVectors || memoryVectors.length === 0) return [];
+
     const activeText = `
       ${memory.decision}
       ${memory.intent}
@@ -234,27 +316,41 @@ export default function App() {
       ${memory.reasoning}
     `;
 
-    const keywords = extractKeywords(activeText);
+    const queryVector = buildVector(activeText);
+    if (Object.keys(queryVector).length === 0) return [];
 
-    if (keywords.length === 0) return [];
+    return memoryVectors
+      .map((mv) => {
+        const sim = vectorSimilarity(queryVector, mv.vector);
 
-    const threshold = keywords.length > 4 ? 3 : 2;
+      const mem = savedMemories.find((m) => m.id === mv.id);
+        if (!mem) return null;
 
-    return savedMemories
-      .map((mem, index) => ({
-        index,
-        score: getMemoryRelevanceScore(mem, keywords),
-      }))
-      .filter((item) => item.score >= threshold)
+        const daysOld =
+          (Date.now() - mem.createdAt) / (1000 * 60 * 60 * 24);
+
+        const recencyBoost = daysOld < 30 ? 1 : 0;
+
+        return {
+          index: savedMemories.findIndex((m) => m.id === mv.id),
+          score: sim + recencyBoost,
+        };
+      })
+      .filter(
+        (x): x is { index: number; score: number } =>
+          x !== null && x.score > 0
+      )
       .sort((a, b) => b.score - a.score)
       .slice(0, 3)
-      .map((item) => item.index);
+      .map((x) => x.index);
   };
+
 
   useEffect(() => {
     const suggestions = getSuggestedMemoryIndexes();
     setSuggestedMemoryIndexes(suggestions);
-  }, [memory, savedMemories]);
+  }, [memory, savedMemories, memoryVectors, hasLoadedVectors]);
+
 
   const orderedMemories = [...savedMemories].sort((a, b) => {
     const aIndex = savedMemories.findIndex((m) => m.id === a.id);
@@ -281,7 +377,13 @@ export default function App() {
 
   //MIGHT NEED filteredMemories, removed now for the system uses orderedMemories now.
 
-  const canSave = MEMORY_FLOW.every((k) => memory[k].trim());
+  const canSave =
+    memory.decision ||
+    memory.intent ||
+    memory.constraints ||
+    memory.alternatives ||
+    memory.reasoning;
+
 
   const synthesis = canSave
     ? `Decision: ${memory.decision}
@@ -293,54 +395,66 @@ Reasoning: ${memory.reasoning}`
 
   /* ---------------- Conversation ---------------- */
 
-
-
-  const handleSend = () => {
-    if (!input.trim()) return;
-
-    //Blocked typing during review
-    if (conversationMode === "review") return;
-
-    // different behaviour in reflection mode
-      if (conversationMode === "reflecting") {
-        continueReflection();
-        return;
-      }
-
-    setMessages((prev) => [...prev, { role: "user", text: input }]);
-    setMemory((prev) => ({ ...prev, [currentField]: input }));
-
-    const idx = MEMORY_FLOW.indexOf(currentField);
-    const next = MEMORY_FLOW[idx + 1];
-
-    if (next) {
-      setMessages((prev) => [
-        ...prev,
-        { role: "ai", text: questionForField(next) },
-      ]);
-      setCurrentField(next);
-    } else {
-      setMessages((prev) => [
-        ...prev,
-        {
-          role: "ai",
-          text:
-            `Here’s a clear snapshot of what you’ve shared.
-        
-    You can now review everything.
-    • Edit any field if needed
-    • Confirm when you’re ready to save`,
-        },
-      ]);
-      setConversationMode("review");
-    }
-
-
-    setInput("");
+  const shouldInfer = (messages: Message[]) => {
+    const userMessages = messages.filter((m) => m.role === "user");
+    return userMessages.length >= 3; // critical threshold
   };
 
+  const handleSend = async () => {
+    if (!input.trim()) return;
+    if (conversationMode === "review") return;
 
-  /* ---------------- Save Decision ---------------- */
+    const userMessage: Message = { role: "user", text: input };
+
+    // 1. Show user message immediately
+    const updatedMessages = [...messages, userMessage];
+    setMessages(updatedMessages);
+    setInput("");
+
+    // 2. Infer memory silently (after enough signal)
+    if (shouldInfer(updatedMessages)) {
+      const inferred = await inferMemoryFromConversation(updatedMessages);
+
+      if (inferred) {
+        setMemory((prev) => ({
+          decision: inferred.decision || prev.decision,
+          intent: inferred.intent || prev.intent,
+          constraints: inferred.constraints || prev.constraints,
+          alternatives: inferred.alternatives || prev.alternatives,
+          reasoning: inferred.reasoning || prev.reasoning,
+        }));
+      }
+    }
+
+    // 3. AI responds naturally (conversation AI)
+    const aiText = await generateAI({
+      system: `
+  You are running locally on the user's device.
+  You help a human gain clarity about a decision.
+
+  Behavior:
+  - Reflect what the user just said
+  - Progress the thinking forward
+  - Do NOT repeat the same question in different words
+  - If intent, constraints, or preferences become clear, acknowledge them
+
+  Rules:
+  - Ask at most ONE follow-up question
+  - Stop asking questions once enough context exists
+  - Never give recommendations unless explicitly asked
+  `,
+      user: updatedMessages
+        .map((m) => `${m.role.toUpperCase()}: ${m.text}`)
+        .join("\n"),
+    });
+
+    setMessages((prev) => [
+  ...prev,
+  { role: "ai", text: aiText || "I’m thinking this through with you." },
+]);
+
+  };
+
 
   /* ---------------- AI Core ---------------- */
 
@@ -417,25 +531,68 @@ Reasoning: ${memory.reasoning}`
     }
   };
 
+  /* ---------------- AI Inference ---------------- */
+
+  const inferMemoryFromConversation = async (messages: Message[]) => {
+    const conversationText = messages
+      .map((m) => `${m.role.toUpperCase()}: ${m.text}`)
+      .join("\n");
+  
+    const aiResponse = await generateAI({
+      system: MEMORY_INFERENCE_SYSTEM,
+      user: `
+  Here is the conversation so far:
+    
+  ${conversationText}
+    
+  Infer the decision-related fields from this conversation.
+  If something is unclear, leave it empty.
+  `,
+    });
+  
+    try {
+      return JSON.parse(aiResponse);
+    } catch {
+      return null;
+    }
+  };
+  
 
 
   const saveDecision = async () => {
-    if (!hasLoadedMemories) return;
-    
+    if (!hasLoadedMemories || !hasLoadedVectors) return;
+
     const summary = await generateSummary(memory);
+
+    const fullText = `
+      ${memory.decision}
+      ${memory.intent}
+      ${memory.constraints}
+      ${memory.alternatives}
+      ${memory.reasoning}
+    `;
+
+    const id = crypto.randomUUID();
 
     setSavedMemories((prev) => [
       {
         ...memory,
         summary,
-        id: crypto.randomUUID(),
+        id,
         archived: false,
         createdAt: Date.now(),
       },
       ...prev,
     ]);
 
-    setSelectedMemoryIndexes([]);
+    setMemoryVectors((prev) => [
+      {
+        id,
+        vector: buildVector(fullText),
+      },
+      ...prev,
+    ]);
+
     setMemory({
       decision: "",
       intent: "",
@@ -443,11 +600,23 @@ Reasoning: ${memory.reasoning}`
       alternatives: "",
       reasoning: "",
     });
-
+  
     setCurrentField("decision");
     setConversationMode("capturing");
-    setMessages([{ role: "ai", text: questionForField("decision") }]);
+    setInput("");
+  
+    setMessages([
+      {
+        role: "ai",
+        text: "Alright. If you want, we can look at something else that’s been on your mind.",
+      },
+    ]);
+
+
+    setSelectedMemoryIndexes([]);
   };
+
+
 
   /* ---------------- AI Advisory ---------------- */
 
@@ -637,28 +806,48 @@ Alternatives: ${m.alternatives || "—"}`
                     : `${index * 40}ms`,
                 }}
               >
-                <div
-                  onClick={() =>
-                    setSelectedMemoryIndexes((prev) =>
-                      prev.includes(idx)
-                        ? prev.filter((i) => i !== idx)
-                        : [...prev, idx]
-                    )
-                  }
-                  className={`sidebar-flashcard
-                    ${selectedMemoryIndexes.includes(idx) ? "selected" : ""}
-                    ${isSuggested ? "suggested" : ""}
-                  `}
-
-                >
-                  <div className="sidebar-flashcard-title">
-                    {mem.decision}
+                <div className="sidebar-flashcard-container">
+                  <div
+                    onClick={() =>
+                      setSelectedMemoryIndexes((prev) =>
+                        prev.includes(idx)
+                          ? prev.filter((i) => i !== idx)
+                          : [...prev, idx]
+                      )
+                    }
+                    className={`sidebar-flashcard
+                      ${selectedMemoryIndexes.includes(idx) ? "selected" : ""}
+                      ${isSuggested ? "suggested" : ""}
+                    `}
+                  >
+                    <div className="sidebar-flashcard-title">
+                      {mem.decision}
+                    </div>
+                    
+                    <div className="sidebar-flashcard-summary">
+                      {mem.summary}
+                    </div>
                   </div>
-                
-                  <div className="sidebar-flashcard-summary">
-                    {mem.summary}
-                  </div>
+                    
+                  {/* 🗑️ Delete button */}
+                  <button
+                    className="flashcard-delete-btn"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      const ok = window.confirm("Delete this memory permanently?");
+                      if (ok) deleteMemoryById(mem.id);
+                    }}
+                    title="Delete memory"
+                  >
+                    <img
+                      src="/bin.png"
+                      alt="Delete memory"
+                      className="flashcard-delete-icon"
+                    />
+                  </button>
+                  
                 </div>
+                  
               </div>
             );
           })}
