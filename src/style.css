@@ -511,6 +511,9 @@ button:active {
   display: flex;
   gap: 16px;
   margin-top: 14px;
+  flex-direction: row;  
+  align-items: center;
+  flex-wrap: wrap;  
 }
 
 

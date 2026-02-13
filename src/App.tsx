@@ -1,5 +1,4 @@
-import { useState, useEffect } from "react";
-import { useRef } from "react";
+import { useState, useEffect, useRef } from "react";
 
 /* ---------------- Types ---------------- */
 
@@ -71,6 +70,8 @@ const questionForField = (field: MemoryFieldKey) => {
 /* ---------------- App ---------------- */
 
 export default function App() {
+  const lastInjectedSelectionRef = useRef<string>("");
+  const injectionTimeoutRef = useRef<number | null>(null);
   const [flashcardSearch, setFlashcardSearch] = useState("");
   const [flashcardDate, setFlashcardDate] = useState<"all" | "week" | "month" | "year">("all");
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
@@ -85,14 +86,13 @@ export default function App() {
     setSelectedMemoryIndexes([]);
   };
 
-  /* ---------------- AI Mode ---------------- */
-
-  const aiMode: "offline" = "offline";
-
   /* ---------------- State ---------------- */
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
+  const isSendingRef = useRef(false);
+  const isInjectingMemoryRef = useRef(false);
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
+
 
   const [currentField, setCurrentField] =
     useState<MemoryFieldKey>("decision");
@@ -161,32 +161,95 @@ export default function App() {
   /* ---------------- AI System Prompts ---------------- */
 
   const MEMORY_INFERENCE_SYSTEM = `
-  You are running locally on the user's device.
-  You do not send or receive data from the internet.
+You are a data extraction engine.
 
-  You help a human gain clarity about a personal decision.
+TASK:
+Extract structured decision data from the conversation.
 
-  Your role:
-  - Listen carefully
-  - Reflect what the user has expressed
-  - Infer structured fields from natural conversation
+STRICT RULES:
+- Output ONLY valid JSON
+- No markdown
+- No commentary
+- No explanations
+- No extra text
+- No trailing commas
 
-  Rules:
-  - Do NOT make decisions for the user
-  - Do NOT invent information
-  - Do NOT force completion of fields
-  - If information is unclear, leave it empty
-  - Use the user's own words when possible
+If information is missing, infer conservatively.
 
-  You must return ONLY valid JSON in this exact shape:
-  {
-    "decision": "",
-    "intent": "",
-    "constraints": "",
-    "alternatives": "",
-    "reasoning": ""
-  }
+Return EXACTLY this shape:
+{
+  "decision": "",
+  "intent": "",
+  "constraints": "",
+  "alternatives": "",
+  "reasoning": ""
+
+  If the user is deciding whether to do something, write it as:
+"Whether to <action>"
+
+}
   `;
+
+  //check-begin
+  const inferMemoryFromConversation = async (messages: Message[]) => {
+  const conversationText = messages
+  .filter((m) => m.role === "user")
+  .map((m) => m.text)
+  .join("\n");
+
+
+  const aiResponse = await generateAI({
+    system: MEMORY_INFERENCE_SYSTEM,
+    user: `
+Here is the conversation so far:
+
+${conversationText}
+
+Extract the structured decision fields.
+Return ONLY valid JSON. No explanations.
+`,
+  });
+
+  console.log("INFERENCE AI RAW RESPONSE:", aiResponse);
+
+  try {
+    const parsed = JSON.parse(aiResponse);
+    return parsed;
+  } catch (e) {
+    console.error("Inference JSON parse failed:", aiResponse);
+    return null;
+  }
+
+};
+//check-end
+
+useEffect(() => {
+  if (selectedMemoryIndexes.length === 0) return;
+
+  const selectionKey = selectedMemoryIndexes
+    .slice()
+    .sort()
+    .join(",");
+
+  // prevent reinjecting same selection
+  if (selectionKey === lastInjectedSelectionRef.current) return;
+
+  // debounce
+  if (injectionTimeoutRef.current) {
+    clearTimeout(injectionTimeoutRef.current);
+  }
+
+  injectionTimeoutRef.current = window.setTimeout(() => {
+    const selectedMemories = selectedMemoryIndexes
+      .map((i) => savedMemories[i])
+      .filter(Boolean);
+
+    injectSelectedMemoriesIntoConversation(selectedMemories);
+    lastInjectedSelectionRef.current = selectionKey;
+  }, 300);
+
+}, [selectedMemoryIndexes, savedMemories]);
+
 
 
   /* ---------------- Persist Memories ---------------- */
@@ -291,19 +354,20 @@ export default function App() {
   };
 
   const vectorSimilarity = (
-    a: Record<string, number>,
-    b: Record<string, number>
+    a?: Record<string, number> | null,
+    b?: Record<string, number> | null
   ) => {
+    if (!a || !b) return 0;
     let score = 0;
-
     Object.keys(a).forEach((key) => {
-      if (b[key]) {
-        score += a[key] * b[key];
-      }
+      if (b[key]) score += a[key] * b[key];
     });
-
     return score;
   };
+
+
+
+    const SUGGESTION_THRESHOLD = 2;
 
 
     const getSuggestedMemoryIndexes = () => {
@@ -338,7 +402,7 @@ export default function App() {
       })
       .filter(
         (x): x is { index: number; score: number } =>
-          x !== null && x.score > 0
+          x !== null && x.score > SUGGESTION_THRESHOLD
       )
       .sort((a, b) => b.score - a.score)
       .slice(0, 3)
@@ -395,66 +459,288 @@ Reasoning: ${memory.reasoning}`
 
   /* ---------------- Conversation ---------------- */
 
-  const shouldInfer = (messages: Message[]) => {
-    const userMessages = messages.filter((m) => m.role === "user");
-    return userMessages.length >= 3; // critical threshold
+    const shouldInfer = (messages: Message[]) => {
+      if (isInjectingMemoryRef.current) return false; // ✅ ADD
+      const userMessages = messages.filter((m) => m.role === "user");
+      return userMessages.length >= 1;
+    };
+    
+
+  // ---------- helpers ----------
+
+  const injectSelectedMemoriesIntoConversation = async (
+    memories: DecisionMemory[]
+  ) => {
+    if (isInjectingMemoryRef.current) return;
+    if (isSendingRef.current) return;
+    if (memories.length === 0) return;
+
+    isInjectingMemoryRef.current = true;
+    isSendingRef.current = true;
+  
+    try {
+      const aiText = await generateAI({
+        system: `
+  You are a reflective thinking assistant.
+      
+  The user has selected multiple past decisions they previously considered.
+  These are NOT new decisions — they are historical context.
+      
+  Your task:
+  - Acknowledge these were considered before
+  - Identify patterns, overlaps, or tensions between them
+  - Relate them to the current conversation
+  - Ask at most ONE thoughtful, open-ended question
+  - Stay neutral and supportive
+  - Do NOT recommend or conclude
+        `,
+        user: `
+  Current conversation:
+  ${messages.map((m) => `${m.role.toUpperCase()}: ${m.text}`).join("\n")}
+      
+  Previously considered decisions:
+  ${formatMultipleMemoryContext(memories)}
+      
+  Respond as if recalling meaningful past thoughts together.
+        `,
+      });
+    
+      setMessages((prev) => [
+        ...prev,
+        { role: "ai", text: aiText },
+      ]);
+    } catch (e) {
+      console.error("Multi-memory injection failed", e);
+    } finally {
+      isSendingRef.current = false;
+      isInjectingMemoryRef.current = false;
+    }
+  };
+  
+// --------------------DEPRECATED CODE--------------------
+ /* const injectMemoryIntoConversation = async (mem: DecisionMemory) => {
+    if (isSendingRef.current) return;
+
+    isSendingRef.current = true;
+
+    try {
+      const aiText = await generateAI({
+        system: `
+  You are a reflective thinking assistant.
+
+  The user has selected a past decision they made.
+  This is NOT a new decision — it is prior context.
+
+  Your task:
+  - Acknowledge that this was considered before
+  - Relate it to the current situation
+  - Ask at most ONE gentle, open-ended question
+  - Do NOT push toward saving or concluding
+  - Do NOT restate all fields verbatim
+  - Keep it human and supportive
+        `,
+        user: `
+  Current conversation:
+  ${messages.map((m) => `${m.role.toUpperCase()}: ${m.text}`).join("\n")}
+
+  ${formatMemoryContext(mem)}
+
+  Respond naturally, as if recalling something meaningful.
+        `,
+      });
+
+      setMessages((prev) => [
+        ...prev,
+        { role: "ai", text: aiText },
+      ]);
+    } catch (e) {
+      console.error("Memory injection failed", e);
+    } finally {
+      isSendingRef.current = false;
+    }
+  };*/
+
+  const safe = (next: unknown, prev?: string) => {
+    if (typeof next === "string") {
+      const trimmed = next.trim();
+      return trimmed.length > 0 ? trimmed : prev ?? "";
+    }
+
+    if (Array.isArray(next)) {
+      const joined = next
+        .map((v) => (typeof v === "string" ? v.trim() : ""))
+        .filter(Boolean)
+        .join("; ");
+      return joined.length > 0 ? joined : prev ?? "";
+    }
+
+    return prev ?? "";
   };
 
-  const handleSend = async () => {
-    if (!input.trim()) return;
-    if (conversationMode === "review") return;
 
+const MIN_USER_TURNS_BEFORE_REVIEW = 3;
+
+const userTurnCount = (messages: Message[]) =>
+  messages.filter((m) => m.role === "user").length;
+
+const formatMultipleMemoryContext = (memories: DecisionMemory[]) => {
+  return memories
+    .map(
+      (mem, idx) => `
+Memory ${idx + 1}:
+Decision: ${mem.decision}
+Intent: ${mem.intent || "—"}
+Constraints: ${mem.constraints || "—"}
+Alternatives: ${mem.alternatives || "—"}
+Reasoning: ${mem.reasoning || "—"}
+`
+    )
+    .join("\n");
+};
+
+
+const handleSend = async () => {
+  if (isSendingRef.current) return;
+  if (!input.trim()) return;
+  if (conversationMode === "review") return;
+
+  isSendingRef.current = true;
+
+  try {
     const userMessage: Message = { role: "user", text: input };
-
-    // 1. Show user message immediately
     const updatedMessages = [...messages, userMessage];
+
     setMessages(updatedMessages);
     setInput("");
 
-    // 2. Infer memory silently (after enough signal)
-    if (shouldInfer(updatedMessages)) {
-      const inferred = await inferMemoryFromConversation(updatedMessages);
-
-      if (inferred) {
-        setMemory((prev) => ({
-          decision: inferred.decision || prev.decision,
-          intent: inferred.intent || prev.intent,
-          constraints: inferred.constraints || prev.constraints,
-          alternatives: inferred.alternatives || prev.alternatives,
-          reasoning: inferred.reasoning || prev.reasoning,
-        }));
-      }
-    }
-
-    // 3. AI responds naturally (conversation AI)
     const aiText = await generateAI({
       system: `
-  You are running locally on the user's device.
-  You help a human gain clarity about a decision.
+You are running locally on the user's device.
+You help a human think through a decision calmly and clearly.
 
-  Behavior:
-  - Reflect what the user just said
-  - Progress the thinking forward
-  - Do NOT repeat the same question in different words
-  - If intent, constraints, or preferences become clear, acknowledge them
+CORE PRINCIPLES:
+- This is NOT an interrogation
+- This is a guided thinking space
+- Depth > speed
+- Clarity > completion
+- The user sets the pace, not you
 
-  Rules:
-  - Ask at most ONE follow-up question
-  - Stop asking questions once enough context exists
-  - Never give recommendations unless explicitly asked
-  `,
+GENERAL BEHAVIOR:
+- Reflect what the user just said in your own words
+- Progress the thinking forward naturally
+- Avoid checklist-style questioning
+- It is okay to revisit a topic later
+- Silence (no question) is better than asking too much
+
+QUESTION RULES (STRICT):
+- Ask at most ONE question in a response
+- NEVER ask multiple questions
+- NEVER repeat the same question in different words
+- If nothing essential is missing, do NOT ask a question
+
+CONVERSATION PHASES (implicit — do NOT label them):
+
+PHASE 1 — Exploration
+- Gently reflect the user’s thoughts
+- Ask ONE open-ended question only if it helps understanding
+- Do NOT rush toward conclusions
+
+PHASE 2 — Understanding
+- When enough context exists, STOP asking questions
+- Surface key considerations naturally
+- Introduce observations instead of questions
+- Begin connecting intent, constraints, and emotions
+
+PHASE 3 — Trade-offs
+- Clearly outline, when appropriate:
+  • Pros
+  • Cons
+  • Risks / uncertainties
+- Stay neutral and factual
+- Do NOT recommend an option
+- Do NOT overwhelm — clarity over completeness
+
+PHASE 4 — Reflection
+- Ask ONE question only:
+  “Given all this, what feels like the right direction for you right now?”
+
+ENDING RULES:
+- If the user expresses a leaning or tentative decision:
+  • Acknowledge it
+  • Summarize the situation briefly
+  • STOP asking questions
+- Do NOT force closure unless the user signals readiness
+
+      `,
       user: updatedMessages
         .map((m) => `${m.role.toUpperCase()}: ${m.text}`)
         .join("\n"),
     });
 
+    const withAI = [...updatedMessages, { role: "ai", text: aiText }];
+    setMessages(withAI);
+
+    if (shouldInfer(withAI)) {
+      let inferred: any = null;
+
+      try {
+        inferred = await inferMemoryFromConversation(withAI);
+      } catch (e) {
+        console.error("Inference failed:", e);
+        return;
+      }
+    
+      if (!inferred || typeof inferred !== "object" || Array.isArray(inferred)) {
+        return;
+      }
+    
+      if (
+        typeof inferred.decision !== "string" ||
+        typeof inferred.intent !== "string"
+      ) {
+        return;
+      }
+
+      setMemory((prev) => ({
+        decision: prev.decision || safe(inferred.decision, prev.decision),
+        intent: safe(inferred.intent, prev.intent),
+        constraints: safe(inferred.constraints, prev.constraints),
+        alternatives: safe(inferred.alternatives, prev.alternatives),
+        reasoning: safe(inferred.reasoning, prev.reasoning),
+      }));
+
+    
+      const enoughTurns =
+        userTurnCount(withAI) >= MIN_USER_TURNS_BEFORE_REVIEW;
+    
+      const hasCoreClarity =
+        inferred.decision &&
+        (inferred.intent || inferred.reasoning || inferred.alternatives);
+    
+      if (enoughTurns && hasCoreClarity) {
+        setConversationMode("review");
+      }
+    }
+
+
+  } catch (err) {
+    console.error("Conversation error:", err);
+
     setMessages((prev) => [
-  ...prev,
-  { role: "ai", text: aiText || "I’m thinking this through with you." },
-]);
+      ...prev,
+      {
+        role: "ai",
+        text:
+          "Something went wrong while thinking this through. Let's slow down and try again.",
+      },
+    ]);
+  }
 
-  };
+  finally {
+    isSendingRef.current = false;
+  }
 
+};
 
   /* ---------------- AI Core ---------------- */
 
@@ -480,7 +766,9 @@ Reasoning: ${memory.reasoning}`
       }
     
       const data = await res.json();
-      return data.response ?? "";
+      return typeof data.response === "string" && data.response.trim().length > 0
+          ? data.response
+          : "I'm taking a moment to think this through.";
     };
 
 
@@ -533,31 +821,6 @@ Reasoning: ${memory.reasoning}`
 
   /* ---------------- AI Inference ---------------- */
 
-  const inferMemoryFromConversation = async (messages: Message[]) => {
-    const conversationText = messages
-      .map((m) => `${m.role.toUpperCase()}: ${m.text}`)
-      .join("\n");
-  
-    const aiResponse = await generateAI({
-      system: MEMORY_INFERENCE_SYSTEM,
-      user: `
-  Here is the conversation so far:
-    
-  ${conversationText}
-    
-  Infer the decision-related fields from this conversation.
-  If something is unclear, leave it empty.
-  `,
-    });
-  
-    try {
-      return JSON.parse(aiResponse);
-    } catch {
-      return null;
-    }
-  };
-  
-
 
   const saveDecision = async () => {
     if (!hasLoadedMemories || !hasLoadedVectors) return;
@@ -572,7 +835,9 @@ Reasoning: ${memory.reasoning}`
       ${memory.reasoning}
     `;
 
-    const id = crypto.randomUUID();
+    const id =
+      crypto?.randomUUID?.() ??
+      `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 
     setSavedMemories((prev) => [
       {
@@ -663,16 +928,17 @@ Alternatives: ${m.alternatives || "—"}`
   ${synthesis}
   ${memoryContext}
 
-  Respond STRICTLY in this format:
-
-  TRADE-OFFS:
-  - (max 3 bullet points)
-
-  RISKS / BLIND SPOTS:
-  - (max 3 bullet points)
-
-  REFLECTIVE QUESTION:
-  - (only one question, short)`,
+   You are running locally on the user's device.
+        
+  You are continuing a thoughtful conversation about a confirmed decision.
+        
+  Rules:
+  - Build on the existing decision context
+  - Use selected past decisions as additional context if provided
+  - Go deeper, do NOT summarize again
+  - Ask at most ONE reflective follow-up question
+  - Keep the tone exploratory, not advisory
+  - Do NOT conclude or close the discussion`,
       });
 
       setMessages((prev) => [
@@ -790,6 +1056,9 @@ Alternatives: ${m.alternatives || "—"}`
             const idx = savedMemories.findIndex((m) => m.id === mem.id);
             const visible = isMemoryVisible(mem);
 
+            if (idx === -1) return null;
+
+
             const isSuggested =
               suggestedMemoryIndexes.includes(idx) &&
               !selectedMemoryIndexes.includes(idx);
@@ -808,13 +1077,14 @@ Alternatives: ${m.alternatives || "—"}`
               >
                 <div className="sidebar-flashcard-container">
                   <div
-                    onClick={() =>
+                    onClick={() => {
                       setSelectedMemoryIndexes((prev) =>
                         prev.includes(idx)
                           ? prev.filter((i) => i !== idx)
                           : [...prev, idx]
-                      )
-                    }
+                      );
+                    }}
+
                     className={`sidebar-flashcard
                       ${selectedMemoryIndexes.includes(idx) ? "selected" : ""}
                       ${isSuggested ? "suggested" : ""}
@@ -872,7 +1142,7 @@ Alternatives: ${m.alternatives || "—"}`
           </header>
 
           <p className="text-xs text-[#7e838c] italic mb-4">
-            Your data is safe. Fully offline only. (Ollama)
+            Your data is safe. Fully offline. (Ollama)
           </p>              
 
           <div className="main-grid">
@@ -907,8 +1177,13 @@ Alternatives: ${m.alternatives || "—"}`
                         onKeyDown={(e) => {
                           if (e.key === "Enter" && !e.shiftKey) {
                             e.preventDefault();
-                            handleSend();
+                            if (conversationMode === "reflecting") {
+                              continueReflection();
+                            } else {
+                              handleSend();
+                            }
                           }
+
                         }}
                         rows={1}
                         className="message-input"
@@ -919,9 +1194,18 @@ Alternatives: ${m.alternatives || "—"}`
                         }
                       />
                 
-                      <button onClick={handleSend}>
-                        Send
-                      </button>
+                      <button
+                      onClick={() => {
+                        if (conversationMode === "reflecting") {
+                          continueReflection();
+                        } else {
+                          handleSend();
+                        }
+                      }}
+                    >
+                      Send
+                    </button>
+                    
                     </>
                   )}
                 </div>
@@ -1014,4 +1298,4 @@ function MemoryField({
       />
     </div>
   );
-}
+};
